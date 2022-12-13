@@ -1,23 +1,54 @@
 import argparse
+import logging
 import time
 from pathlib import Path
 
 import os
 import copy
+from urllib.parse import _NetlocResultMixinBase
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+import numpy as np
 
+from models.yolo import Model
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path, save_one_box
 from utils.plots import colors, plot_one_box
-from utils.torch_utils import select_device, load_classifier, time_synchronized
+from utils.torch_utils import select_device, load_classifier, time_synchronized, intersect_dicts
+
+logger = logging.getLogger(__name__)
 
 
-def detect(opt):
+def is_in_poly(p, poly):
+    """
+    :param p: [x, y]
+    :param poly: [[], [], [], [], ...]
+    :return:
+    """
+    px, py, _ = p
+    is_in = False
+    for i, corner in enumerate(poly):
+        next_i = i + 1 if i + 1 < len(poly) else 0
+        x1, y1, _ = corner
+        x2, y2, _ = poly[next_i]
+        if (x1 == px and y1 == py) or (x2 == px and y2 == py):  # if point is on vertex
+            is_in = True
+            break
+        if min(y1, y2) < py <= max(y1, y2):  # find horizontal edges of polygon
+            x = x1 + (py - y1) * (x2 - x1) / (y2 - y1 + 1e-10)
+            if x == px:  # if point is on edge
+                is_in = True
+                break
+            elif x > px:  # if point is on left-side of line
+                is_in = not is_in
+    return is_in
+
+
+def detect(opt, frame_filter=10, warning_frame=1):
     source, weights, view_img, save_txt, imgsz, save_txt_tidl, kpt_label = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size, opt.save_txt_tidl, opt.kpt_label
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
@@ -64,6 +95,8 @@ def detect(opt):
     if device.type != 'cpu':
         model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     t0 = time.time()
+    frame_id = 0
+    warning_buffer = [0] * frame_filter
     for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -74,9 +107,10 @@ def detect(opt):
         # Inference
         t1 = time_synchronized()
         pred = model(img, augment=opt.augment)[0]
-        print(pred[...,4].max())
+        # print(pred[...,4].max())
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms, kpt_label=kpt_label)
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms, kpt_label=kpt_label, nc=model.yaml['nc'], multi_cls_offset=True)
+
         t2 = time_synchronized()
 
         # Apply Classifier
@@ -98,8 +132,39 @@ def detect(opt):
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 scale_coords(img.shape[2:], det[:, :4], im0.shape, kpt_label=False)
-                scale_coords(img.shape[2:], det[:, 6:], im0.shape, kpt_label=kpt_label, step=3)
+                if kpt_label:
+                    scale_coords(img.shape[2:], det[:, 6:], im0.shape, kpt_label=kpt_label, step=3)
+                    
+                output = np.array([out.cpu().numpy() for out in det])
+                bboxes = output[:, :4]
+                poses = output[:, 6:].reshape((-1,17,3))
 
+                flag = False
+                
+                for ii, (bbox_i, pose_i) in enumerate(zip(bboxes, poses)):
+                    for jj, (bbox_j, pose_j) in enumerate(zip(bboxes, poses)):  # i 拥抱 j
+                        if ii != jj and abs(bbox_i[3]-bbox_i[1]) / abs(bbox_j[3]-bbox_j[1]) > 0.8 and \
+                            abs(bbox_i[3]-bbox_i[1]) / abs(bbox_j[3]-bbox_j[1]) < 1.25:
+                                if abs((pose_i[9][1]-pose_i[7][1])/abs(pose_i[9][0]-pose_i[7][0]+1e-10)) > 2 and abs((pose_i[5][1]-pose_i[7][1])/abs(pose_i[5][0]-pose_i[7][0]+1e-10)) > 2 and\
+                                    abs((pose_i[10][1]-pose_i[8][1])/abs(pose_i[10][0]-pose_i[8][0]+1e-10)) > 2 and abs((pose_i[6][1]-pose_i[8][1])/abs(pose_i[6][0]-pose_i[8][0]+1e-10)) > 2:
+                                    continue
+                                if (pose_i[5][0]-pose_j[0][0])*(pose_i[9][0]-pose_j[0][0]) < 0:   # 手腕
+                                    # cv2.circle(im0, (int(pose_i[9][0]), int(pose_i[9][1])), 10, (0, 0, 255), 8)
+                                    flag = True
+                                elif (pose_i[6][0]-pose_j[0][0])*(pose_i[10][0]-pose_j[0][0]) < 0:
+                                    # cv2.circle(im0, (int(pose_i[10][0]), int(pose_i[10][1])), 10, (0, 0, 255), 8)
+                                    flag = True
+                                elif (pose_i[5][0]-pose_j[0][0])*(pose_i[7][0]-pose_j[0][0]) < 0:  # 手肘
+                                    # cv2.circle(im0, (int(pose_i[7][0]), int(pose_i[7][1])), 10, (0, 0, 255), 8)
+                                    flag = True
+                                elif (pose_i[6][0]-pose_j[0][0])*(pose_i[8][0]-pose_j[0][0]) < 0:
+                                    # cv2.circle(im0, (int(pose_i[8][0]), int(pose_i[8][1])), 10, (0, 0, 255), 8)
+                                    flag = True                    
+                
+                warning_buffer[frame_id%frame_filter]=1 if flag else 0
+                isWarning = sum(warning_buffer)>warning_frame
+                frame_id += 1
+                                        
                 # Print results
                 for c in det[:, 5].unique():
                     n = (det[:, 5] == c).sum()  # detections per class
@@ -117,7 +182,7 @@ def detect(opt):
                         c = int(cls)  # integer class
                         label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
                         kpts = det[det_index, 6:]
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness, kpt_label=kpt_label, kpts=kpts, steps=3, orig_shape=im0.shape[:2])
+                        # plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness, kpt_label=kpt_label, kpts=kpts, steps=3, orig_shape=im0.shape[:2])
                         if opt.save_crop:
                             save_one_box(xyxy, im0s, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
@@ -154,6 +219,8 @@ def detect(opt):
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
                             save_path += '.mp4'
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    if isWarning:
+                        im0 = cv2.putText(im0, 'Warning', (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
                     vid_writer.write(im0)
 
     if save_txt or save_txt_tidl or save_img:
@@ -162,14 +229,63 @@ def detect(opt):
 
     print(f'Done. ({time.time() - t0:.3f}s)')
 
+# action_cls = {"sitting":0,"standing":1,"lying":2,"other":3}
+
+# 全员坐满进行初始化
+def init(detect_results):
+    center_x = (detect_results[..., 0] + detect_results[..., 2]) / 2
+    center_y = (detect_results[..., 1] + detect_results[..., 3]) / 2
+    w = abs(detect_results[..., 0] - detect_results[..., 2])
+    h = abs(detect_results[..., 1] - detect_results[..., 3])
+    state = np.zeros(len(detect_results)) # 躺坐为0， 离席为1
+    seat = np.concatenate((center_x,center_y,w,h,seat,state.T),axis=1)
+    return seat
+
+
+def warningAction(detect_result, conf, seat, sigma=1):
+    if detect_result[-2] < conf:
+        return
+    distance = abs(seat[:,0]-detect_result[0]) + abs(seat[:,1]-detect_result[1])
+    min_index = distance.argmin()
+    min_value = distance.min()
+    if min_value < (seat[min_index][2]+seat[min_index][3])/sigma:
+        if detect_result[-1] == 2:
+            seat[min_index][-1] = 0
+            return "lying"
+        elif detect_result[-1] == 0:
+            seat[min_index][-1] = 0
+            return "sitting"
+        elif detect_result[-1] == 1:
+            seat[min_index][-1] = 1
+            return "standing"
+    else:
+        return 
+
+    
+def countAndAction(detect_results, conf, seat, sigma=1):
+    seat_number = seat.shape[0]
+    person_number = 0
+    detect_lying = []
+    for detect_result in detect_results:
+        state = warningAction(detect_result, conf, seat, sigma=sigma)
+        if state is not None:
+            person_number += 1
+        if state == "lying":
+            detect_lying.append(detect_result)
+    
+    flag = True if person_number < seat_number else False
+    
+    # 趴桌(人)， 缺席（状态值）, 离席（座位，可以通过最有一个元素查看离席的座位）
+    return detect_lying, flag, seat
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
-    parser.add_argument('--source', type=str, default='data/images', help='source')  # file/folder, 0 for webcam
-    parser.add_argument('--img-size', nargs= '+', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
+    parser.add_argument('--source', type=str, default='data/hug', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--img-size', nargs= '+', type=int, default=960, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.8, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')

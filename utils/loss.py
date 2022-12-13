@@ -87,9 +87,10 @@ class QFocalLoss(nn.Module):
 
 class ComputeLoss:
     # Compute losses
-    def __init__(self, model, autobalance=False, kpt_label=False):
+    def __init__(self, model, autobalance=False, kpt_label=False, nc=1):
         super(ComputeLoss, self).__init__()
         self.kpt_label = kpt_label
+        self.nc = nc
         device = next(model.parameters()).device  # get model device
         h = model.hyp  # hyperparameters
 
@@ -129,6 +130,7 @@ class ComputeLoss:
                 ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
 
                 # Regression
+
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
@@ -136,16 +138,21 @@ class ComputeLoss:
                 lbox += (1.0 - iou).mean()  # iou loss
                 if self.kpt_label:
                     #Direct kpt prediction
-                    pkpt_x = ps[:, 6::3] * 2. - 0.5
-                    pkpt_y = ps[:, 7::3] * 2. - 0.5
-                    pkpt_score = ps[:, 8::3]
+                    # print(pxy[0])
+                    pkpt_x = ps[:, self.nc+5::3].sigmoid() * 2. - 0.5
+                    pkpt_y = ps[:, self.nc+6::3].sigmoid() * 2. - 0.5
+                    pkpt_score = ps[:, self.nc+7::3].sigmoid()
                     #mask
-                    kpt_mask = (tkpt[i][:, 0::2] != 0)
+                    kpt_mask = []
+                    kpt_mask = (tkpt[i][:, 0::2])
                     lkptv += self.BCEcls(pkpt_score, kpt_mask.float()) 
+                    # print(pkpt_score[0])
+                    # print(kpt_mask.float()[0])
                     #l2 distance based loss
-                    #lkpt += (((pkpt-tkpt[i])*kpt_mask)**2).mean()  #Try to make this loss based on distance instead of ordinary difference
+                    # lkpt += (((pkpt-tkpt[i])*kpt_mask)**2).mean()  #Try to make this loss based on distance instead of ordinary difference
                     #oks based loss
                     d = (pkpt_x-tkpt[i][:,0::2])**2 + (pkpt_y-tkpt[i][:,1::2])**2
+                    # lkpt += d.mean()
                     s = torch.prod(tbox[i][:,-2:], dim=1, keepdim=True)
                     kpt_loss_factor = (torch.sum(kpt_mask != 0) + torch.sum(kpt_mask == 0))/torch.sum(kpt_mask != 0)
                     lkpt += kpt_loss_factor*((1 - torch.exp(-d/(s*(4*sigmas**2)+1e-9)))*kpt_mask).mean()
@@ -154,9 +161,9 @@ class ComputeLoss:
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
+                    t = torch.full_like(ps[:, 5:self.nc+5], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += self.BCEcls(ps[:, 5:self.nc+5], t)  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
@@ -172,11 +179,15 @@ class ComputeLoss:
         lbox *= self.hyp['box']
         lobj *= self.hyp['obj']
         lcls *= self.hyp['cls']
-        lkptv *= self.hyp['cls']
-        lkpt *= self.hyp['kpt']
+        if self.kpt_label:
+            lkptv *= self.hyp['cls']
+            lkpt *= self.hyp['kpt']
         bs = tobj.shape[0]  # batch size
 
-        loss = lbox + lobj + lcls + lkpt + lkptv
+        if self.kpt_label:
+            loss = lbox + lobj + lcls + lkpt + lkptv
+        else:
+            loss = lbox + lobj + lcls
         return loss * bs, torch.cat((lbox, lobj, lcls, lkpt, lkptv, loss)).detach()
 
     def build_targets(self, p, targets):
